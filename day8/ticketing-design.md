@@ -605,27 +605,71 @@ Redis short-lived keys (e.g., `SET lock:seat:10421 user_id NX PX 15000`) act as 
 
 ---
 
-### 6.5 Hold Expiration & Safe Release
+### 6.5 Automated Seat-Hold Expiration Process & Safe Release
 
-A seat hold lasts exactly 10 minutes ($600\text{ seconds}$). Holds are cleaned using a **Two-Tier Strategy**:
+A temporary seat hold reserves inventory for a fixed duration of exactly 10 minutes ($600\text{ seconds}$). Releasing abandoned holds in a high-concurrency ticketing system requires strict transactional safety to prevent inventory corruption, race conditions, or accidental releases of confirmed purchases.
 
-1. **Lazy Expiration (Inline Evaluation)**:
-   The `SELECT ... FOR UPDATE` + application check (and the alternative `UPDATE ... WHERE`) explicitly includes the condition:
-   `OR (status = 'HELD' AND hold_expires_at < NOW())`.
-   If a user abandoned a hold 15 minutes ago and a new user clicks the seat, the new user immediately captures it without waiting for any background batch job.
-2. **Eager Expiration (Background Worker Sweeper)**:
-   A Celery/RabbitMQ worker wakes every 15 seconds to run:
-   ```sql
-   UPDATE seats
-   SET status          = 'AVAILABLE',
-       held_by_user_id = NULL,
-       hold_token      = NULL,
-       hold_expires_at = NULL,
-       version         = version + 1
-   WHERE status = 'HELD' 
-     AND hold_expires_at < NOW();
-   ```
-   This worker broadcasts an event to the Redis pub/sub channel, which pushes updated seat map states to connected frontends via Server-Sent Events.
+#### 1. Authoritative Timestamp Stored in PostgreSQL
+Each seat hold stores its expiration deadline directly on the `seats` record in PostgreSQL via `hold_expires_at TIMESTAMP WITH TIME ZONE`, alongside `held_by_user_id`, `hold_token`, and `status = 'HELD'`. PostgreSQL is the single source of truth for seat reservation status and expiration times.
+
+#### 2. Periodic Batch Sweeper Worker
+While individual checkout attempts evaluate hold validity lazily, an automated background sweeper worker (orchestrated via Celery Beat / RabbitMQ) runs periodically every 10–15 seconds to sweep and release abandoned seats in manageable batches:
+
+```sql
+-- Step 1: Select a bounded batch of expired holds with row locking
+-- SKIP LOCKED prevents contention with active checkout transactions or concurrent sweeper workers.
+BEGIN;
+
+SELECT id, event_id, section, row, seat_number
+FROM seats
+WHERE status = 'HELD'
+  AND hold_expires_at < NOW()
+LIMIT 500
+FOR UPDATE SKIP LOCKED;
+
+-- Step 2: Atomically release the locked expired seats back to AVAILABLE
+UPDATE seats
+SET status          = 'AVAILABLE',
+    held_by_user_id = NULL,
+    hold_token      = NULL,
+    hold_expires_at = NULL,
+    version         = version + 1,
+    updated_at      = NOW()
+WHERE id IN (/* batch IDs from Step 1 */)
+  AND status = 'HELD'             -- Double safeguard: never touch SOLD seats
+  AND hold_expires_at < NOW();
+
+COMMIT;
+```
+
+#### 3. Idempotent Cleanup & Confirmed Seat Safety
+The hold release query is strictly idempotent:
+- The predicate `WHERE status = 'HELD' AND hold_expires_at < NOW()` guarantees that seats transitioned to `SOLD` by a successful checkout will **never** match the release query.
+- Even if a sweeper process crashes, restarts, or retries the same batch multiple times, seats that are already `AVAILABLE` or `SOLD` remain untouched. Retries cannot release confirmed seats or corrupt inventory counts.
+
+#### 4. Delayed Payment Callback Revalidation
+Payment gateways like Stripe deliver confirmations asynchronously via webhooks. If network congestion or third-party latency causes a webhook callback to arrive after the 10-minute hold window has expired:
+- The webhook handler **must never** blindly mark the seat as confirmed.
+- Instead, the webhook callback opens a database transaction and acquires an exclusive row lock:
+  ```sql
+  BEGIN;
+  SELECT id, status, hold_token, hold_expires_at
+  FROM seats
+  WHERE id = :seat_id
+  FOR UPDATE;
+  ```
+- If the hold has already expired and the seat has been released or acquired by a new buyer (`status != 'HELD'` or `hold_token != :webhook_hold_token`), the callback handler aborts the transaction (`ROLLBACK`).
+- The application then executes an automated, idempotent refund through the payment gateway API (`stripe.refunds.create({payment_intent: ...})`) and dispatches an apologetic email with store credit. Double-allocation is physically prevented.
+
+#### 5. Fault Tolerance, Retries, and Overdue Hold Recovery
+- If a background sweep job encounters a transient database timeout or worker crash, Celery retries the job using exponential backoff with jitter.
+- Sweeper failures are logged to Prometheus/Sentry, triggering alerts if unreleased expired holds exceed threshold limits.
+- Because the sweeper query checks `hold_expires_at < NOW()`, any hold that was missed during a transient worker outage will be automatically and safely collected by the very next sweep cycle.
+
+#### 6. State Authority: PostgreSQL vs. Redis
+- Redis keys and expiration TTLs (e.g., `lock:seat:{id}`) serve solely as an advisory performance cache to shed redundant incoming requests.
+- Redis expiration or key eviction **never** releases inventory. A seat is only released when PostgreSQL commits the state change.
+- Even if Redis is flushed or crashes entirely, PostgreSQL remains fully consistent and authoritative. Redis availability caches are refreshed by listening to database change events or repopulating from PostgreSQL on demand.
 
 ---
 
@@ -684,23 +728,64 @@ COMMIT;
 
 ---
 
-## 7. Trade-Off Analysis
+## 7. Trade-Off Analysis & Architectural Decisions
 
-### 7.1 Trade-Off 1: Strict Consistency vs. High Availability (CAP Theorem)
+Building a resilient, high-concurrency event ticketing platform requires deliberate engineering trade-offs between consistency, availability, performance, and operational complexity.
+
+### 7.1 Automated Seat-Hold Expiration Sweep: Periodic Batch Worker vs. Inline Lazy Release
+- **Option A (Inline Lazy Release Only)**: Evaluate hold expiration only when a new user attempts to reserve the expired seat (`WHERE status = 'AVAILABLE' OR (status = 'HELD' AND hold_expires_at < NOW())`).
+- **Option B (Periodic Batch Sweeper Only)**: Rely exclusively on a scheduled background cron to scan and release seats every minute.
+- **Option C (Hybrid Strategy - Chosen)**: Combine immediate lazy evaluation on write with an asynchronous periodic batch sweeper running every 10–15 seconds with `LIMIT 500 FOR UPDATE SKIP LOCKED`.
+- **Benefits**: Lazy release guarantees zero wait time for active buyers wanting an abandoned seat, while the periodic batch sweeper actively restores inventory to the visual seat map and pushes real-time updates via Server-Sent Events (SSE).
+- **Costs**: Requires running background worker processes and executing periodic database queries that could contribute to connection and lock overhead.
+- **Mitigation**: Use partial indexes (`idx_seats_hold_expiry WHERE status = 'HELD'`), batch limits (`LIMIT 500`), and `SKIP LOCKED` to prevent the sweeper from contending with active checkouts.
+
+---
+
+### 7.2 Trade-Off 1: Read Replicas vs. Data Freshness (Replication Lag)
+- **Benefits**: Read replicas scale read throughput horizontally and absorb the massive query volume from users browsing the event catalog, inspecting venue metadata, and viewing historical orders. This removes 90%+ of read traffic from the primary database, keeping primary CPU and IOPS dedicated to critical booking transactions.
+- **Costs**: PostgreSQL asynchronous replication introduces replication lag (typically 20–200 ms, spiking up to several seconds during heavy write spikes). Replicas can therefore return stale data, displaying a seat as "available" when it was already held or sold milliseconds earlier on the primary.
+- **Mitigation**: 
+  - Strictly route all state-mutating requests—specifically seat hold acquisition (`POST /api/v1/events/{id}/holds`) and final payment checkout (`POST /api/v1/orders/checkout`)—directly to the **authoritative PostgreSQL primary database** using transactional row-level locks (`SELECT ... FOR UPDATE`).
+  - Treat read replica responses as strictly **advisory** for initial page loads. When a user clicks to hold a seat, the primary database performs an authoritative check, rejecting stale selections with an immediate `409 Conflict` before any payment is initiated.
+
+---
+
+### 7.3 Trade-Off 2: Caching vs. Strict Consistency
+- **Benefits**: High-speed in-memory caching (Redis cluster and CDN edge caches) absorbs flash sale ingress exceeding 16,000 requests per second. Serving seat availability maps and static event assets from cache delivers sub-10 ms response times and protects backend databases from connection pool exhaustion and crash-level concurrency.
+- **Costs**: Cached inventory data is inherently eventually consistent and can quickly become stale as seats are reserved during a flash sale drop. Users may attempt to select seats that are already taken, creating higher client-side friction.
+- **Mitigation**:
+  - Treat all cache data as purely **advisory**. The cache provides high-speed browsing, but **never** acts as the source of truth for seat ownership.
+  - Require all hold and purchase operations to validate state transactionally on PostgreSQL against row-level locks and hard schema constraints (`UNIQUE (event_id, seat_id)`).
+  - Use Redis Pub/Sub combined with Server-Sent Events (SSE) to broadcast seat hold and release events to connected client applications within milliseconds, minimizing the window of cache staleness.
+
+---
+
+### 7.4 Trade-Off 3: Asynchronous Queues vs. Processing Delay
+- **Benefits**: Message queues (RabbitMQ/Celery) decouple the synchronous HTTP checkout flow from non-critical, high-latency tasks such as cryptographic QR barcode signing, PDF ticket generation, and transactional email dispatch. This keeps checkout API latency below 500 ms and shields the primary database and third-party email providers from sudden traffic spikes.
+- **Costs**: Introduces processing delay where digital tickets are not immediately returned in the HTTP response body. Also introduces operational complexity: managing message queues, handling potential message loss, out-of-order execution, worker crashes, and retry storms.
+- **Mitigation**:
+  - Make all background worker consumers strictly **idempotent** by keying tasks to unique `order_id` values.
+  - Implement automated exponential-backoff retries with jitter and configure Dead Letter Queues (DLQ) for poison messages to alert engineers without halting the queue.
+  - Return an immediate synchronous confirmation (`200 OK` with `order_id` and order summary) to the user upon payment capture, while allowing ticket passes to be retrieved asynchronously via `GET /api/v1/users/me/tickets` once rendering completes.
+
+---
+
+### 7.5 Trade-Off 4: Strict Consistency vs. High Availability (CAP Theorem)
 - **Option A**: Prioritize Availability (AP). Accept eventual consistency across multi-master databases to avoid ever rejecting a user request.
 - **Option B (Chosen)**: Prioritize Strict Consistency (CP) on the booking and seat hold engine.
 - **Rationale**: In event ticketing, overselling or double-booking leads to severe reputational damage, breach of contract, legal liability, and logistical chaos at venue turnstiles. It is vastly preferable to return a clean `409 Conflict ("Seat already taken")` to one user than to sell the same physical chair to two different fans. For static browsing, we leverage eventual consistency at the CDN edge, but the booking path is strictly CP.
 
 ---
 
-### 7.2 Trade-Off 2: Virtual Waiting Room vs. Immediate Direct Access
+### 7.6 Trade-Off 5: Virtual Waiting Room vs. Immediate Direct Access
 - **Option A**: Immediate Direct Access. Allow all 200,000 users to connect and hit backend servers simultaneously at 10:00 AM.
 - **Option B (Chosen)**: Virtual Waiting Room (Cloudflare / Redis token bucket). Meter user ingress so only 500 active buyers enter the checkout funnel per second.
 - **Rationale**: Unrestricted access creates catastrophic thundering herd problems, connection pool exhaustion, and server crashes, rendering the site unusable for everyone. A virtual waiting room enforces fair FIFO queueing, completely eliminates bot automated sniping, smooths database write loads to steady sustainable levels ($\approx 33\text{ sales/sec}$), and guarantees a responsive, reliable experience for users actively buying.
 
 ---
 
-### 7.3 Trade-Off 3: Temporary Seat Holds (10 Minutes) vs. Instant Checkout (No Holds)
+### 7.7 Trade-Off 6: Temporary Seat Holds (10 Minutes) vs. Instant Checkout (No Holds)
 - **Option A**: Instant Checkout without Holds. Seats remain available until payment fully settles. Whoever completes payment first wins.
 - **Option B (Chosen)**: 10-Minute Temporary Seat Hold. Holding a seat takes it off the market for 10 minutes while the user enters payment info.
 - **Rationale**: Instant checkout creates extreme user frustration: buyers input credit card details only to find their seat vanished at the final click ("payment race condition"). Temporary holds provide a human-friendly checkout experience. Although it introduces the risk of abandoned carts and temporarily locked inventory, our 10-minute timeout and automated sweeper ensure unpurchased seats quickly return to genuine buyers.
