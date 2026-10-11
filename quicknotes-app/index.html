@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>QuickNotes App</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="script.js" defer></script>
+</head>
+<body>
+  <header>
+    <h1>QuickNotes</h1>
+    <p>Organize your thoughts, tasks, and studies in one place.</p>
+  </header>
+
+  <main>
+    <section class="card" aria-labelledby="add-note-heading">
+      <h2 id="add-note-heading">Add a note</h2>
+      <form id="note-form" novalidate>
+        <div class="form-group">
+          <label for="note-input">Note</label>
+          <input
+            type="text"
+            id="note-input"
+            name="note-input"
+            placeholder="Write your note here (max 200 characters)..."
+            autocomplete="off"
+          >
+          <p id="error-message" class="error-message" aria-live="polite"></p>
+        </div>
+
+        <div class="form-controls">
+          <div class="category-group">
+            <label for="category-select">Category</label>
+            <select id="category-select" name="category">
+              <option value="personal">Personal</option>
+              <option value="work">Work</option>
+              <option value="study">Study</option>
+            </select>
+          </div>
+
+          <button type="submit" id="add-note-btn">Add Note</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="card" aria-labelledby="your-notes-heading">
+      <div class="section-header">
+        <h2 id="your-notes-heading">Your notes</h2>
+        <button type="button" id="clear-all-btn" class="clear-all-btn">Clear All</button>
+      </div>
+
+      <div class="search-bar">
+        <label for="search-input" class="visually-hidden">Search notes</label>
+        <input
+          type="text"
+          id="search-input"
+          placeholder="Search notes..."
+          autocomplete="off"
+        >
+      </div>
+
+      <p id="note-count" class="note-count">You have no notes yet.</p>
+
+      <ul id="notes-list" class="notes-list"></ul>
+    </section>
+  </main>
+
+  <footer>
+    <p>&copy; 2026 QuickNotes. Built with semantic HTML, CSS, and JavaScript.</p>
+  </footer>
+</body>
+</html>
