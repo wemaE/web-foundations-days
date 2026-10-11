@@ -257,6 +257,7 @@ TicketHub provides a versioned RESTful API returning standard JSON payloads, adh
 
 #### 5. View Purchased Tickets: `GET /api/v1/users/me/tickets`
 - **Purpose**: Retrieve confirmed digital tickets with QR bar codes.
+- **Request Headers**: `Authorization: Bearer <jwt_token>`
 - **Response (`200 OK`)**:
 ```json
 {
@@ -703,3 +704,56 @@ COMMIT;
 - **Option A**: Instant Checkout without Holds. Seats remain available until payment fully settles. Whoever completes payment first wins.
 - **Option B (Chosen)**: 10-Minute Temporary Seat Hold. Holding a seat takes it off the market for 10 minutes while the user enters payment info.
 - **Rationale**: Instant checkout creates extreme user frustration: buyers input credit card details only to find their seat vanished at the final click ("payment race condition"). Temporary holds provide a human-friendly checkout experience. Although it introduces the risk of abandoned carts and temporarily locked inventory, our 10-minute timeout and automated sweeper ensure unpurchased seats quickly return to genuine buyers.
+
+---
+
+## 8. System Risks, Monitoring, and Scaling Decisions
+
+### 8.1 Key Failure Modes & Risk Mitigations
+
+1. **Thundering Herd on Hold Expiration**:
+   - **Risk**: When thousands of 10-minute holds expire nearly simultaneously, massive numbers of waiting clients might refresh and hammer the database looking for released seats.
+   - **Mitigation**: The background sweeper staggers updates with jitter. Rather than forcing clients to poll aggressively, seat status transitions (`HELD` $\rightarrow$ `AVAILABLE`) are pushed via Redis Pub/Sub to Server-Sent Events (SSE) connections, eliminating polling spikes.
+
+2. **Payment Gateway Latency & Timeouts**:
+   - **Risk**: External payment gateways (e.g., Stripe) may experience latency spikes (3–10 seconds) during heavy concert drops, tying up backend threads and exhausting database connection pools if executed inside transactions.
+   - **Mitigation**: External gateway HTTP requests are strictly executed **outside** database transactions. The hold is verified and marked in progress, the database connection is returned to the pool, the payment gateway is called with an `Idempotency-Key`, and only after the gateway returns is a new fast transaction opened to commit `seat_allocations` and mark the seat `SOLD`.
+
+3. **Database Connection Pool Exhaustion**:
+   - **Risk**: A sudden scale-out of hundreds of stateless application server pods can saturate PostgreSQL's maximum connection limit (`max_connections`), leading to rejected queries.
+   - **Mitigation**: Deploy **PgBouncer** connection poolers in transaction-pooling mode directly in front of the PostgreSQL Primary. This multiplexes thousands of active application worker threads over a fixed, compact pool of 100–150 dedicated database connections.
+
+4. **Cache Inconsistency or Redis Failure**:
+   - **Risk**: A Redis node reboot or split-brain could report inaccurate seat availability or drop advisory locks.
+   - **Mitigation**: Redis is treated as an advisory acceleration layer only. The PostgreSQL Primary and its hard uniqueness constraint `uq_seat_allocation UNIQUE (event_id, seat_id)` are the single source of truth. If Redis fails completely, requests gracefully degrade to PostgreSQL row locks without risking double-bookings.
+
+---
+
+### 8.2 Observability & Monitoring Strategy (SLIs / SLOs)
+
+To guarantee system reliability during high-profile ticket sales, the operational telemetry stack continuously tracks:
+
+| Telemetry Metric (SLI) | Target Threshold (SLO) | Alert Condition & Trigger |
+| :--- | :--- | :--- |
+| **Row Lock Wait Time** (`pg_stat_activity`) | $p99 < 50\text{ ms}$ | Alert P1 if any lock wait exceeds $1{,}500\text{ ms}$ for $> 10\text{ seconds}$ |
+| **Connection Pool Saturation** | $< 80\%$ utilized | Alert P1 if PgBouncer client wait queue depth $> 25$ |
+| **Hold Route Latency** (`POST /holds`) | $p95 < 250\text{ ms}$, $p99 < 400\text{ ms}$ | Alert P2 if $p99 > 500\text{ ms}$ over 2-minute rolling window |
+| **Checkout Route Latency** (`POST /checkout` excl. gateway) | $p95 < 300\text{ ms}$, $p99 < 500\text{ ms}$ | Alert P2 if $p99 > 750\text{ ms}$ over 2-minute rolling window |
+| **HTTP Error Ratio** (5xx vs 4xx) | $5\text{xx} < 0.05\%$ of total ingress | Alert P1 if $5\text{xx} \ge 0.1\%$ (HTTP 409 Conflict is expected and tracked separately) |
+| **Redis Cache Hit Ratio** (Seat Map) | $> 95\%$ cache hit rate | Alert P2 if cache hit rate drops below $90\%$ during an active drop |
+| **Asynchronous Worker Queue Depth** | $< 500$ queued jobs | Alert P2 if Celery/RabbitMQ ticket dispatch lag exceeds 60 seconds |
+
+---
+
+### 8.3 Long-Term Scaling Decisions
+
+1. **Horizontal Database Sharding by `event_id`**:
+   - For a single venue drop (20,000 seats), a single PostgreSQL primary easily handles the required $\approx 33\text{ transactions/sec}$.
+   - For simultaneous nationwide stadium tours across multiple cities, databases can be horizontally sharded by `event_id`. Because seat holds and bookings never span multiple events, each shard operates with complete transactional isolation and zero cross-shard coordination overhead.
+
+2. **Closed-Loop Dynamic Waiting Room Throttle**:
+   - The Virtual Waiting Room admission rate dynamically responds to downstream database health metrics. If PostgreSQL connection pool utilization exceeds 85% or lock wait time exceeds 200 ms, the waiting room automatically steps down the admission rate from 500 users/sec to 250 users/sec until database performance stabilizes.
+
+3. **Read/Write Workload Isolation**:
+   - 100% of event browsing, catalog searching, and historical ticket viewing queries are routed to read replicas and edge caches. The primary PostgreSQL database instance is strictly dedicated to critical write transactions (`POST /holds` and `POST /checkout`), ensuring maximum IOPS and CPU availability for booking operations.
+
