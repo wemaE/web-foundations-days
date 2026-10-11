@@ -90,6 +90,8 @@ Photo files belong in **dedicated cloud object storage** (e.g., Amazon S3, Googl
 
 ## 4. Architecture Diagram
 
+The following text diagram shows the full system topology: clients at the top, CDN and load balancer as the entry layer, stateless app servers in the middle tier, and the data tier (cache, primary database, read replicas, object storage, message queue, and thumbnail workers) at the bottom.
+
 ```
 [ Clients / Mobile Apps / Web Browsers ]
          |                         |
@@ -98,36 +100,43 @@ Photo files belong in **dedicated cloud object storage** (e.g., Amazon S3, Googl
          v                         v
    +------------+           +-------------------+
    |    CDN     |           |   Load Balancer   |
-   +------------+           +-------------------+
-         |                            |
-         | (Cache Miss)        +------+------+
-         v                     |             |
-   +------------+              v             v
-   |   Object   |<====  +-------------+ +-------------+
-   |  Storage   |    |  | App Server  | | App Server  |
-   | (S3 / GCS) |    |  |  (Node/Go)  | |  (Node/Go)  |
-   +------------+    |  +-------------+ +-------------+
-         ^           |      |      |           |
-         |           |      |      +-----+-----+
-         |           |      |            |
-(Writes  |           |      v            v
-Thumb-   |     (Uploads) +-------+  +-----------------+
- nails)  |           |   | Cache |  | Primary DB (SQL)|
-         |           |   |(Redis)|  |    (Writes)     |
-         |           |   +-------+  +-----------------+
-   +------------+    |                       |
-   | Thumbnail  |    |               (Replication)
-   |   Worker   |    |                       v
-   +------------+    |              +-----------------+
-         ^           |              |  Read Replica   |
-         |           |              |     (Reads)     |
-    (Pulls Job)      |              +-----------------+
-         |           |
-   +------------+    |
-   |   Queue    |<---+
+   | (Edge Cache|           | (Round-Robin /    |
+   |  & HTTPS   |           |  Health Checks)   |
+   | Termination|           +-------------------+
+   +------------+                    |
+         |                   +-------+-------+
+         | (Cache Miss)       |               |
+         v                   v               v
+   +------------+     +-----------+   +-----------+
+   |   Object   |<==  | App Server|   | App Server|
+   |  Storage   |  |  | (Node/Go) |   | (Node/Go) |
+   | (S3 / GCS) |  |  +-----------+   +-----------+
+   +------------+  |       |      \   /      |
+         ^         |       |       \ /       |
+         |         |       v        v        v
+  (Writes:         |   +-------+  +-----------------+
+  Thumbnails)      |   | Cache |  | Primary DB (SQL)|
+         |         |   |(Redis)|  |  (Writes only)  |
+         |         |   +-------+  +-----------------+
+   +------------+  |                       |
+   | Thumbnail  |  |               (Async Replication)
+   |  Worker    |  |                       v
+   +------------+  |              +-----------------+
+         ^         |              |  Read Replicas  |
+         |         |              | (Feed / Profile |
+    (Pulls Job)    |              |   Read Queries) |
+         |         |              +-----------------+
+   +------------+  |
+   |   Message  |<-+  (Publish thumbnail job on upload)
+   |   Queue    |
    |(SQS/Rabbit)|
    +------------+
 ```
+
+**Data Flow Summary**:
+- **Reads**: Clients → CDN (edge cache hit) → Object Storage (cache miss for media); Clients → Load Balancer → App Servers → Redis Cache → Read Replicas
+- **Writes**: Clients → Load Balancer → App Servers → Primary DB (metadata) + Object Storage (file) + Message Queue (job)
+- **Background**: Queue → Thumbnail Workers → Object Storage (thumbnails) + Primary DB (metadata update) → CDN (served on next request)
 
 ---
 
@@ -138,9 +147,9 @@ Thumb-   |     (Uploads) +-------+  +-----------------+
 - **App Servers**: Execute core application business logic, including authenticating requests, validating uploads, assembling feed payloads, and coordinating persistence across data stores.
 - **Cache (In-Memory / Redis)**: Stores precomputed user feeds, active sessions, and frequently accessed photo metadata in RAM to deliver sub-millisecond read responses and shield the database from repetitive queries.
 - **Primary Database**: Handles authoritative relational data writes, user accounts, and photo metadata transactions with ACID guarantees.
-- **Read Replica Database**: Synchronously or asynchronously replicates data from the primary database to serve read-only queries (e.g., user profiles, photo metadata lookups) and distribute query load.
+- **Read Replicas**: Synchronously or asynchronously replicate data from the primary database to serve read-only queries (e.g., user profiles, photo metadata lookups) and distribute query load horizontally across multiple nodes.
 - **Object Storage**: Durably stores original raw photo files and generated thumbnails in a highly available, infinitely scalable, and cost-effective distributed storage system.
-- **Message Queue**: Decouples photo upload ingestion from background image processing, buffering thumbnail generation tasks to guarantee asynchronous and resilient execution.
+- **Message Queue**: Decouples photo upload ingestion from background image processing, buffering thumbnail generation tasks to guarantee asynchronous and resilient execution even under spiky upload load.
 - **Thumbnail Worker**: Consumes image processing jobs from the queue, downloads original photos, generates optimized 50 KB thumbnails, uploads them back to object storage, and updates the database with thumbnail references.
 
 ---
@@ -148,30 +157,32 @@ Thumb-   |     (Uploads) +-------+  +-----------------+
 ## 6. End-to-End Upload Flow
 
 1. **Client Upload Initiation**: The user selects a photo on the client app and sends an upload request to the Load Balancer, which routes the request to an available App Server.
-2. **Metadata & Pre-signed URL / Direct Ingestion**: The App Server authenticates the user, validates file parameters (MIME type, size $\le 2\text{ MB}$), stores initial photo metadata (status: `processing`, `user_id`, `created_at`, photo ID) in the **Primary Database**, and receives the file binary.
-3. **Persist to Object Storage**: The App Server streams the raw 2 MB photo file directly to **Object Storage** under a unique key path (e.g., `s3://snapshare-media/originals/{photo_id}.jpg`).
-4. **Publish Asynchronous Job**: Upon successful upload to object storage, the App Server pushes a thumbnail generation message containing `{photo_id, original_s3_url, user_id}` onto the **Message Queue**.
-5. **Immediate Client Response**: The App Server immediately returns a `201 Created` response to the client with the photo ID and temporary status, allowing the user interface to remain responsive without waiting for thumbnail rendering.
-6. **Worker Processing**: An available **Thumbnail Worker** pulls the message from the queue, downloads the 2 MB original from Object Storage, resizes the image to a standardized 50 KB thumbnail, and uploads the thumbnail to Object Storage (e.g., `s3://snapshare-media/thumbnails/{photo_id}.jpg`).
-7. **Metadata Update & Cache Eviction**: The worker updates the photo record in the **Primary Database** with the thumbnail URL and status `published`, then invalidates or updates the user's feed cache in **Redis**.
-8. **Edge CDN Delivery**: When followers view their feed, the App Server returns the CDN URL for the thumbnail. The client requests the image from the **CDN**, which caches the thumbnail at the edge on first access and serves subsequent views with minimal latency.
+2. **Persist to Object Storage**: The App Server authenticates the user, validates file parameters (MIME type, size ≤ 2 MB), and streams the raw 2 MB photo file directly to **Object Storage** under a unique key path (e.g., `s3://snapshare-media/originals/{photo_id}.jpg`).
+3. **Save Metadata to Database**: The App Server writes initial photo metadata (status: `processing`, `user_id`, `photo_id`, `created_at`, `original_url`) to the **Primary Database** with an ACID-guaranteed INSERT.
+4. **Enqueue Thumbnail Job**: Upon confirming the successful write to both object storage and the database, the App Server publishes a thumbnail generation message containing `{photo_id, original_s3_url, user_id}` to the **Message Queue**.
+5. **Immediate Client Response**: The App Server immediately returns a `201 Created` response to the client with the photo ID and a `processing` status, allowing the user interface to remain responsive without waiting for thumbnail rendering.
+6. **Worker Generates Thumbnails**: An available **Thumbnail Worker** pulls the message from the queue, downloads the 2 MB original from Object Storage, and resizes the image to a standardized 50 KB thumbnail using an image processing library (e.g., libvips, Sharp).
+7. **Store Thumbnails in Object Storage**: The worker uploads the finished thumbnail to Object Storage (e.g., `s3://snapshare-media/thumbnails/{photo_id}.jpg`) and updates the photo record in the **Primary Database** with the thumbnail URL and status `published`.
+8. **Deliver via CDN**: When followers view their feed, the App Server returns the CDN URL for the thumbnail. The client requests the image from the **CDN**, which fetches from Object Storage on the first access, caches the thumbnail at the nearest edge node, and serves all subsequent views with sub-50 ms latency.
 
 ---
 
 ## 7. Architectural Trade-offs
 
-### Trade-off 1: Cache Freshness vs. Read Latency
-- **Context**: SnapShare can precompute and cache feeds in Redis with fixed Time-To-Live (TTL) expiration or event-driven cache invalidation.
+### Trade-off 1: Read-Replica Replication Lag vs. Feed Freshness
+
+- **Context**: SnapShare routes feed and profile read queries to PostgreSQL read replicas to horizontally scale read throughput. Writes go exclusively to the primary database, which replicates changes to replicas asynchronously.
 - **Analysis**:
-  - *Prioritizing Speed (Long TTL / Cache-Aside)*: Serving feeds entirely out of Redis guarantees response times under 15 ms, effortlessly sustaining the peak 2,894 views/sec. However, a newly uploaded photo may not appear in friends' feeds until the TTL expires (e.g., 60–120 seconds).
-  - *Prioritizing Freshness (Immediate Fan-Out on Write)*: Immediately invalidating and updating every follower's cached feed guarantees instantaneous visibility of new posts. However, for users with thousands of followers ("celebrity problem"), writing a single photo triggers a massive burst of cache writes and database queries, increasing system complexity, write amplification, and latency.
-- **Decision for SnapShare**: Adopt a hybrid model: fan-out writes to active users with a moderate 60-second TTL cache fallback, accepting short eventual consistency to preserve low read latencies.
+  - *Replica Reads (Eventual Consistency)*: Offloading 100% of read traffic to replicas maximizes scalability and keeps the primary write throughput optimal at ~12 writes/sec. However, asynchronous replication typically introduces 50–500 ms of lag. A user who just uploaded a photo and immediately refreshes their own profile feed may not see their newly posted image if the replica has not yet received the write.
+  - *Primary Reads (Strict Consistency)*: Routing all reads—including feed views—to the primary database guarantees that users always see their most recent uploads. However, routing the peak ~2,894 read queries/sec to a single primary creates contention with incoming write transactions, risking lock timeouts, connection pool exhaustion, and degraded write performance.
+- **Decision for SnapShare**: Implement **read-your-own-writes consistency**—route a user's own requests (their profile page, their upload confirmation) to the primary database or an optimistic client-side cache for 2–5 seconds following an upload, while routing all follower feed queries to read replicas. This satisfies the expectation that a user sees their own post immediately, without compromising system-wide scalability.
 
 ---
 
-### Trade-off 2: Consistency vs. Read-Replica Performance (Replication Lag)
-- **Context**: Read queries are routed to database read replicas to scale query throughput, while writes hit the primary database.
+### Trade-off 2: Asynchronous Thumbnail Processing vs. Immediate Thumbnail Availability
+
+- **Context**: Generating a 50 KB thumbnail from a 2 MB original photo requires CPU-intensive image decoding, scaling, and re-encoding. SnapShare offloads this work to a background message queue and dedicated worker fleet rather than performing it inline within the HTTP upload request.
 - **Analysis**:
-  - *Strict Consistency (Read-After-Write from Primary)*: If a user uploads a photo and immediately refreshes their own profile, routing the read to a read replica may result in the user not seeing their newly uploaded photo if the replica is experiencing asynchronous replication lag (typically 50–500 ms). Reading strictly from the primary ensures immediate consistency, but routing all profile reads to the primary risks overloading it during traffic spikes.
-  - *Eventual Consistency (All Reads from Replicas)*: Offloading 100% of read traffic to replicas maximizes database scalability and keeps primary write throughput optimal, but users may perceive transient inconsistencies right after write operations.
-- **Decision for SnapShare**: Implement **read-your-own-writes consistency**: route a user's own requests to the primary database (or serve from optimistic client state / local cache) for 2–5 seconds following an upload, while routing all general feed and follower queries to read replicas. This satisfies user expectations without compromising overall system scalability.
+  - *Asynchronous Processing (Chosen)*: The App Server responds to the uploader immediately after persisting the original file, without waiting for thumbnail generation. This ensures upload API response times stay well under 1 second regardless of worker load or queue depth. However, a newly uploaded photo briefly exists in a `processing` state; followers who view the feed within the first few seconds after an upload may see a placeholder rather than the final thumbnail.
+  - *Synchronous Inline Rendering*: Generating the thumbnail synchronously within the upload HTTP handler guarantees that the thumbnail is ready the instant the client receives `201 Created`. However, image resizing is CPU-bound and can take 200–2,000 ms per photo; at the peak upload rate of ~12 uploads/sec, this would block App Server threads and saturate CPU, directly degrading latency for concurrent feed readers and other API operations.
+- **Decision for SnapShare**: Asynchronous thumbnail processing is the correct choice. The Thumbnail Worker fleet scales independently of App Servers, preventing upload spikes from impacting read latency. The brief `processing` placeholder state is an acceptable UX trade-off. To minimize user-perceived delay, workers are scaled to maintain a queue processing time of under 5 seconds, and the client UI displays the original (lower-priority) image as a progressive fallback until the CDN-cached thumbnail is ready.
