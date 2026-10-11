@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>User Directory - Day 5</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="users.js" defer></script>
+</head>
+<body>
+  <header>
+    <h1>User Directory</h1>
+    <p>Fetch, filter, and inspect remote users asynchronously.</p>
+  </header>
+
+  <main>
+    <section class="controls-card">
+      <div class="actions-row">
+        <button id="load-users" type="button">Load Users</button>
+      </div>
+
+      <div class="filter-group">
+        <label for="filter-input">Filter by name</label>
+        <input
+          type="text"
+          id="filter-input"
+          placeholder="Type a name to filter..."
+          autocomplete="off"
+        >
+      </div>
+
+      <p id="status" class="status-message" aria-live="polite"></p>
+    </section>
+
+    <section class="users-section">
+      <ul id="users-list" class="users-list"></ul>
+    </section>
+  </main>
+
+  <footer>
+    <p>&copy; 2026 User Directory. Built with async/await and JSONPlaceholder API.</p>
+  </footer>
+</body>
+</html>

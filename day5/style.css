@@ -1,0 +1,223 @@
+/* Day 5 - User Directory Styles */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
+  line-height: 1.6;
+  background-color: #f1f5f9;
+  color: #1e293b;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+header {
+  background: linear-gradient(135deg, #1e40af 0%, #3b82f6 100%);
+  color: #ffffff;
+  text-align: center;
+  padding: 36px 20px;
+  box-shadow: 0 4px 12px rgba(30, 64, 175, 0.15);
+}
+
+header h1 {
+  margin: 0 0 6px 0;
+  font-size: 2rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+header p {
+  margin: 0;
+  font-size: 1rem;
+  opacity: 0.9;
+}
+
+main {
+  max-width: 900px;
+  width: 100%;
+  margin: 32px auto;
+  padding: 0 20px;
+  flex: 1;
+}
+
+.controls-card {
+  background-color: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 24px;
+  margin-bottom: 28px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.04);
+}
+
+.actions-row {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+button#load-users {
+  background-color: #2563eb;
+  color: #ffffff;
+  font-family: inherit;
+  font-size: 1rem;
+  font-weight: 600;
+  padding: 10px 22px;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background-color 0.2s ease, opacity 0.2s ease, transform 0.1s ease;
+}
+
+button#load-users:hover:not(:disabled) {
+  background-color: #1d4ed8;
+}
+
+button#load-users:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+button#load-users:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.filter-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+label[for="filter-input"] {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #334155;
+}
+
+input#filter-input {
+  width: 100%;
+  padding: 10px 14px;
+  font-family: inherit;
+  font-size: 1rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background-color: #ffffff;
+  color: #1e293b;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+input#filter-input:focus {
+  outline: none;
+  border-color: #2563eb;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
+}
+
+.status-message {
+  margin: 14px 0 0 0;
+  font-size: 0.95rem;
+  font-weight: 500;
+  min-height: 1.5rem;
+  color: #64748b;
+  transition: color 0.2s ease;
+}
+
+.status-message.loading {
+  color: #2563eb;
+}
+
+.status-message.success {
+  color: #16a34a;
+}
+
+.status-message.error {
+  color: #dc2626;
+}
+
+/* Users Grid */
+.users-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 16px;
+}
+
+.user-card {
+  background-color: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-left: 5px solid #3b82f6;
+  border-radius: 8px;
+  padding: 18px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.03);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.user-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.06);
+}
+
+.user-name {
+  margin: 0 0 4px 0;
+  font-size: 1.15rem;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.user-email,
+.user-city,
+.user-company {
+  margin: 0;
+  font-size: 0.9rem;
+  color: #475569;
+  word-break: break-word;
+}
+
+.user-email strong,
+.user-city strong,
+.user-company strong {
+  color: #1e293b;
+}
+
+.no-match {
+  grid-column: 1 / -1;
+  text-align: center;
+  color: #64748b;
+  font-style: italic;
+  padding: 24px;
+  background-color: #ffffff;
+  border-radius: 8px;
+  border: 1px dashed #cbd5e1;
+}
+
+footer {
+  text-align: center;
+  padding: 24px 20px;
+  color: #64748b;
+  font-size: 0.875rem;
+  border-top: 1px solid #e2e8f0;
+  margin-top: auto;
+}
+
+@media (max-width: 600px) {
+  header {
+    padding: 24px 16px;
+  }
+
+  main {
+    margin: 20px auto;
+    padding: 0 16px;
+  }
+
+  .users-list {
+    grid-template-columns: 1fr;
+  }
+}
