@@ -295,15 +295,15 @@ The TicketHub data model is implemented on a relational database (PostgreSQL) to
         | 1                         | 1
         |                           |
         | *                         | *
-+---------------+ 1       * +---------------+
-|     seats     |-----------|  order_items  |
-+---------------+           +---------------+
-| id (PK)       |           | id (PK)       |
-| event_id (FK) |           | order_id (FK) |
-| section       |           | seat_id (FK)  |
-| row           |           | price_cents   |
-| seat_number   |           +---------------+
-| status        |
++---------------+ 1       * +------------------+
+|     seats     |-----------|   seat_allocations|
++---------------+           +------------------+
+| id (PK)       |           | id (PK)          |
+| event_id (FK) |           | order_id (FK)    |
+| section       |           | seat_id (FK)     |
+| row           |           | event_id (FK)    |
+| seat_number   |           | price_cents      |
+| status        |           +------------------+
 | hold_token    |
 | hold_user_id  |
 | hold_expires  |
@@ -371,15 +371,22 @@ CREATE TABLE orders (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
 
--- 5. ORDER_ITEMS TABLE (Junction linking confirmed seats to orders)
-CREATE TABLE order_items (
+-- 5. SEAT_ALLOCATIONS TABLE
+--    This is the authoritative record of which confirmed order owns which seat.
+--    It is separate from the seats table so the unique constraint is always
+--    enforced on CONFIRMED bookings, independently of transient hold state.
+CREATE TABLE seat_allocations (
     id BIGSERIAL PRIMARY KEY,
     order_id BIGINT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
     seat_id BIGINT NOT NULL REFERENCES seats(id) ON DELETE RESTRICT,
+    event_id BIGINT NOT NULL REFERENCES events(id) ON DELETE RESTRICT,
     price_cents INTEGER NOT NULL CHECK (price_cents >= 0),
-    
-    -- A single seat can only belong to one confirmed order
-    CONSTRAINT uq_order_seat UNIQUE (seat_id)
+
+    -- DATABASE-ENFORCED: A (event, seat) pair can appear in at most ONE
+    -- confirmed allocation. Even if application-level logic is bypassed by
+    -- a retry storm or a bug, the database engine raises constraint violation
+    -- error 23505, making double-booking physically impossible.
+    CONSTRAINT uq_seat_allocation UNIQUE (event_id, seat_id)
 );
 ```
 
@@ -443,7 +450,8 @@ TicketHub employs a decoupled, multi-tier cloud architecture designed to isolate
 |  Redis Cluster Cache  |   |  Primary Database     |   |  Read Replica DB      |
 |  - Fast Seat Bitmaps  |   |  (PostgreSQL Primary) |   |  (PostgreSQL Replica) |
 |  - Waiting Room Tokens|   |  - ACID Seat Holds    |   |  - Read Event Catalog |
-|  - Distributed Locks  |   |  - Financial Checkout |   |  - Historical Orders  |
+|  - Advisory Locks     |   |  - Financial Checkout |   |  - Historical Orders  |
+|  (Optimization Only)  |   |  - seat_allocations   |   |                       |
 +-----------------------+   +-----------------------+   +-----------------------+
                                       |
                          +------------+------------+
@@ -472,8 +480,8 @@ TicketHub employs a decoupled, multi-tier cloud architecture designed to isolate
 3. **Virtual Waiting Room**: Throttles the 200,000 flash sale arrivals into a steady, controlled admission rate (e.g., admitting 500 users/second) through cryptographic admission cookies, protecting downstream infrastructure from crash-level concurrency.
 4. **Application Load Balancer (AWS ALB)**: Distributes incoming HTTPS requests evenly across stateless backend instances using round-robin and active health checks.
 5. **Application Servers (App Server Nodes 1..N)**: Horizontally auto-scaled backend nodes (Node.js/Go) executing business logic, input validation, and database transaction orchestration.
-6. **Redis Cluster (In-Memory Data Store)**: Maintains high-speed seat availability bitmaps for the interactive seat map, stores waiting-room queue state, and provides distributed token buckets.
-7. **PostgreSQL Primary Database**: Single write master enforcing ACID transactions, row-level locks, and physical uniqueness constraints for seat holds and order creation.
+6. **Redis Cluster (In-Memory Data Store)**: Maintains high-speed seat availability bitmaps for the interactive seat map, stores waiting-room queue state, and provides optional short-lived advisory locks as a **performance optimization only**. Redis locks serve as a fast pre-filter to shed obviously redundant requests before they reach PostgreSQL; they are **never** the source of truth for seat ownership and cannot substitute for database-level locking.
+7. **PostgreSQL Primary Database**: Single write master enforcing ACID transactions, row-level locks (`SELECT ... FOR UPDATE`), and the hard `UNIQUE(event_id, seat_id)` constraint on `seat_allocations` for seat holds and order creation. This is the sole source of truth for all booking state.
 8. **PostgreSQL Read Replicas**: Replicated read-only nodes absorbing search, event browsing, and historical order lookups to keep the primary database unburdened.
 9. **Stripe / Payment Gateway**: External PCI-compliant provider executing payment card captures and delivering asynchronous success webhooks.
 10. **RabbitMQ / Async Workers**: Message queue and background workers asynchronously processing PDF ticket rendering, barcode signing, email dispatch, and sweeping expired holds.
@@ -485,7 +493,7 @@ TicketHub employs a decoupled, multi-tier cloud architecture designed to isolate
 1. **Traffic Decoupling via Virtual Waiting Room**: When 200,000 users arrive at 10:00 AM, the CDN and Waiting Room intercept 100% of ingress traffic. Users enter a fair FIFO queue and receive an encrypted queue token.
 2. **Metered Admission**: The queue admits users in small batches matching database capacity (e.g., 200–500 buyers/sec). 
 3. **Read/Write Separation**: 95% of requests (seat map views) hit Redis read-caches and PostgreSQL Read Replicas.
-4. **Primary Write Isolation**: Only the critical hold mutation (`POST /holds`) touches the PostgreSQL Primary. Because admitted users are metered, write contention is kept within safe PostgreSQL lock contention thresholds ($\approx 33\text{ transactions/sec}$), preventing lock timeouts or connection pool exhaustion.
+4. **Primary Write Isolation**: Only the critical hold mutation (`POST /holds`) and checkout (`POST /orders/checkout`) touch the PostgreSQL Primary. Because admitted users are metered, write contention is kept within safe PostgreSQL lock contention thresholds ($\approx 33\text{ transactions/sec}$), preventing lock timeouts or connection pool exhaustion.
 
 ---
 
@@ -493,63 +501,126 @@ TicketHub employs a decoupled, multi-tier cloud architecture designed to isolate
 
 Preventing double-booking is the foundational correctness requirement of TicketHub. Seat allocation must be strictly atomic: **competing requests for the same seat can never both succeed.**
 
-### 6.1 Concrete Implementation: Atomic Conditional Updates with Row-Level Locking
+### 6.1 Defence-in-Depth Strategy
 
-To avoid deadlocks while guaranteeing mutual exclusion, TicketHub utilizes **Atomic Conditional Updates** backed by PostgreSQL row-level locks.
+TicketHub uses three complementary layers to prevent double-booking, ordered from fastest to strongest:
 
-#### 1. The Seat Hold Acquisition Query
-When User A and User B simultaneously click "Reserve Seat #10421", the backend executes:
+| Layer | Mechanism | Role |
+| :--- | :--- | :--- |
+| **Layer 1 — Redis (Advisory)** | Short-lived Redis key per seat (e.g., `lock:seat:{id}`, TTL 15 s), set with `SET NX PX` | *Performance optimization only.* Sheds duplicate concurrent requests before they hit the database. Not the source of truth; a Redis failure or expiry does NOT release a confirmed booking. |
+| **Layer 2 — PostgreSQL Row-Level Lock** | `SELECT ... FOR UPDATE` inside a `READ COMMITTED` (or stronger) transaction | *Mutual exclusion at the database level.* Guarantees only one writer can modify a seat row at a time. |
+| **Layer 3 — DB Unique Constraint** | `UNIQUE(event_id, seat_id)` on `seat_allocations` | *Last-resort hard guard.* Even if application logic is bypassed by a bug or retry storm, the database engine raises error 23505 and rolls back the second insert. |
+
+---
+
+### 6.2 Concrete Implementation: Seat Hold with Row-Level Locking
+
+When User A and User B simultaneously click "Reserve Seat #10421", the backend executes the following **inside a PostgreSQL transaction at READ COMMITTED isolation or stronger**:
 
 ```sql
--- Executed inside a READ COMMITTED transaction
-UPDATE seats
-SET status = 'HELD',
-    held_by_user_id = :user_id,
-    hold_token = :generated_token,
-    hold_expires_at = NOW() + INTERVAL '10 minutes',
-    version = version + 1,
-    updated_at = NOW()
+-- Step 1: Lock the target row for the duration of this transaction.
+-- Any concurrent transaction attempting the same seat will block here
+-- until this transaction commits or rolls back.
+BEGIN;
+
+SELECT id, status, hold_expires_at
+FROM seats
 WHERE id = :seat_id
-  AND (
-      status = 'AVAILABLE' 
-      OR (status = 'HELD' AND hold_expires_at < NOW())
-  );
+FOR UPDATE;  -- acquires an exclusive row-level write lock
+
+-- Step 2: Application code checks the fetched row.
+-- If status != 'AVAILABLE' AND NOT (status = 'HELD' AND hold_expires_at < NOW()):
+--   ROLLBACK; return HTTP 409 Conflict.
+
+-- Step 3: Perform the hold update (runs only if Step 2 passed).
+UPDATE seats
+SET status          = 'HELD',
+    held_by_user_id = :user_id,
+    hold_token      = :generated_token,
+    hold_expires_at = NOW() + INTERVAL '10 minutes',
+    version         = version + 1,
+    updated_at      = NOW()
+WHERE id = :seat_id;
+
+COMMIT;
 ```
 
-#### How Atomicity is Guaranteed:
-1. PostgreSQL acquires an exclusive **Row-Level Write Lock (`X-Lock`)** on the target row for the duration of the `UPDATE` evaluation.
-2. If User A's transaction arrives micro-seconds ahead of User B's, User A satisfies `status = 'AVAILABLE'`. Exactly **1 row is updated** (`rows_affected == 1`).
-3. User B's update blocks until User A's row lock is released. When User B evaluates the `WHERE` clause, the row's `status` is now `'HELD'` and `hold_expires_at > NOW()`.
-4. User B's condition evaluates to `FALSE`, returning **0 rows affected** (`rows_affected == 0`).
-5. The application code detects `rows_affected == 0`, immediately rolls back, and returns `HTTP 409 Conflict` to User B.
+**How atomicity is guaranteed under concurrent load:**
+
+1. PostgreSQL acquires an exclusive **Row-Level Write Lock (X-Lock)** on seat `#10421` the moment `SELECT ... FOR UPDATE` executes.
+2. User A's transaction arrives microseconds ahead. It reads `status = 'AVAILABLE'`, proceeds to `UPDATE`, and commits. Lock is released.
+3. User B's `SELECT ... FOR UPDATE` was **blocked** while User A held the X-Lock. Once User A commits, User B re-reads the row and sees `status = 'HELD'` with a valid `hold_expires_at`.
+4. The application detects the seat is now held by someone else and **rolls back**, returning `HTTP 409 Conflict` to User B. Zero double-holds.
+
+**Alternative — Atomic Conditional UPDATE (lock-free shorthand):**
+
+```sql
+-- Single-statement atomic conditional update; no explicit FOR UPDATE needed.
+-- PostgreSQL still acquires a row-level lock internally for the duration of UPDATE.
+UPDATE seats
+SET status          = 'HELD',
+    held_by_user_id = :user_id,
+    hold_token      = :generated_token,
+    hold_expires_at = NOW() + INTERVAL '10 minutes',
+    version         = version + 1,
+    updated_at      = NOW()
+WHERE id = :seat_id
+  AND (
+      status = 'AVAILABLE'
+      OR (status = 'HELD' AND hold_expires_at < NOW())
+  );
+-- rows_affected == 1 → hold granted; rows_affected == 0 → return 409 Conflict
+```
+
+Both approaches are safe. The `SELECT ... FOR UPDATE` pattern is preferred when the application needs to inspect the seat's current state (section, price, hold owner) before deciding how to proceed.
 
 ---
 
-### 6.2 Hard Database Constraints
+### 6.3 Hard Database Constraints (Last-Resort Guard)
 
-To guard against race conditions or multi-seat cross-order leaks:
-1. **`uq_event_section_row_seat UNIQUE (event_id, section, row, seat_number)`**: Physically prevents duplicate seats from existing in the database.
-2. **`uq_order_seat UNIQUE (seat_id)` on `order_items`**: The database schema physically prevents a seat from being inserted into more than one confirmed order. Even if an application bug bypassed the hold logic, the database engine would throw a fatal unique constraint violation (`23505`), preventing double-purchase.
+```sql
+-- On seat_allocations, enforce that the same (event, seat) pair
+-- can only ever appear once — i.e., only one confirmed buyer per seat.
+CONSTRAINT uq_seat_allocation UNIQUE (event_id, seat_id)
+```
+
+This constraint means:
+
+1. **`UNIQUE(event_id, seat_id)` on `seat_allocations`**: When checkout finalizes, the handler inserts a row into `seat_allocations`. If two concurrent checkouts somehow both pass the hold check (e.g., due to an application bug or a race during delayed payment confirmation), the second `INSERT` will fail with PostgreSQL error `23505` (unique constraint violation). The database engine rolls back the second transaction automatically, and no double-booking is recorded.
+2. **`uq_event_section_row_seat UNIQUE (event_id, section, row, seat_number)` on `seats`**: Physically prevents duplicate seat records from existing for the same venue and event—the data integrity baseline.
+
+These constraints ensure correctness regardless of application-layer bugs, retry storms, or network partitions.
 
 ---
 
-### 6.3 Hold Expiration & Safe Release
+### 6.4 Role of Redis: Optimization, Not Source of Truth
+
+Redis short-lived keys (e.g., `SET lock:seat:10421 user_id NX PX 15000`) act as a **fast pre-filter** only:
+
+- If the key is already set, the request is rejected at the application layer before touching PostgreSQL — this reduces unnecessary database load during a 16,667 req/sec flash sale peak.
+- If Redis is unavailable, slow, or the key has expired, the request **falls through to PostgreSQL**, which enforces correctness via row-level locking and the unique constraint.
+- Redis state is **never** used to confirm or record a seat allocation. A Redis key expiring or being evicted cannot release a confirmed `seat_allocation` database record.
+- Redis is repopulated from PostgreSQL on cache miss or after a Redis restart, ensuring it always reflects database reality, not the other way around.
+
+---
+
+### 6.5 Hold Expiration & Safe Release
 
 A seat hold lasts exactly 10 minutes ($600\text{ seconds}$). Holds are cleaned using a **Two-Tier Strategy**:
 
 1. **Lazy Expiration (Inline Evaluation)**:
-   Notice that the `UPDATE` query above explicitly includes:
+   The `SELECT ... FOR UPDATE` + application check (and the alternative `UPDATE ... WHERE`) explicitly includes the condition:
    `OR (status = 'HELD' AND hold_expires_at < NOW())`.
    If a user abandoned a hold 15 minutes ago and a new user clicks the seat, the new user immediately captures it without waiting for any background batch job.
 2. **Eager Expiration (Background Worker Sweeper)**:
    A Celery/RabbitMQ worker wakes every 15 seconds to run:
    ```sql
    UPDATE seats
-   SET status = 'AVAILABLE',
+   SET status          = 'AVAILABLE',
        held_by_user_id = NULL,
-       hold_token = NULL,
+       hold_token      = NULL,
        hold_expires_at = NULL,
-       version = version + 1
+       version         = version + 1
    WHERE status = 'HELD' 
      AND hold_expires_at < NOW();
    ```
@@ -557,7 +628,7 @@ A seat hold lasts exactly 10 minutes ($600\text{ seconds}$). Holds are cleaned u
 
 ---
 
-### 6.4 Payment Confirmation & Failure Handling
+### 6.6 Payment Confirmation & Failure Handling
 
 When a user submits payment, the checkout handler executes a strict sequence:
 
@@ -565,34 +636,37 @@ When a user submits payment, the checkout handler executes a strict sequence:
 [User Submits Payment]
         |
         v
-[Step 1: Verify Hold in DB Transaction]
-SELECT * FROM seats 
-WHERE id = :seat_id 
+[Step 1: Acquire Row Lock & Verify Hold — inside BEGIN transaction]
+SELECT id, status, hold_token, hold_expires_at
+FROM seats
+WHERE id = :seat_id
   AND hold_token = :provided_hold_token
   AND status = 'HELD'
   AND hold_expires_at > NOW()
 FOR UPDATE;
         |
-        +---> [Hold Expired?] ---> ABORT, Return 410 Gone (No Charge)
+        +--> [Hold Not Found / Expired?] --> ROLLBACK, Return 410 Gone (No Charge)
         |
         v
-[Step 2: Charge Payment Gateway with Idempotency Key]
-Charge $240.00 via Stripe API
+[Step 2: Charge Payment Gateway with Idempotency Key — OUTSIDE transaction]
+Charge $240.00 via Stripe API (idempotency_key = client-supplied UUID)
         |
-        +---> [Payment Declined?] ---> Keep Hold Alive, Return 402/422
+        +--> [Payment Declined?] --> ROLLBACK, Keep Hold Alive, Return 402/422
         |
         v [Payment Succeeded]
-[Step 3: Atomically Finalize in Database]
+[Step 3: Atomically Finalize in Database — same or new BEGIN]
 BEGIN;
-  UPDATE seats 
-  SET status = 'SOLD', hold_expires_at = NULL 
-  WHERE id = :seat_id;
-  
-  INSERT INTO orders (idempotency_key, status, ...) 
-  VALUES (:idempotency_key, 'PAID', ...);
-  
-  INSERT INTO order_items (order_id, seat_id, ...) 
-  VALUES (:order_id, :seat_id, ...);
+  UPDATE seats
+  SET status = 'SOLD', hold_expires_at = NULL
+  WHERE id = :seat_id AND hold_token = :provided_hold_token;
+
+  INSERT INTO orders (idempotency_key, user_id, event_id, total_amount_cents, status, ...)
+  VALUES (:idempotency_key, :user_id, :event_id, :amount_cents, 'PAID', ...);
+
+  -- This INSERT enforces UNIQUE(event_id, seat_id): if another buyer somehow
+  -- confirmed the same seat concurrently, this raises error 23505 → ROLLBACK.
+  INSERT INTO seat_allocations (order_id, seat_id, event_id, price_cents)
+  VALUES (:order_id, :seat_id, :event_id, :price_cents);
 COMMIT;
         |
         v
@@ -600,8 +674,12 @@ COMMIT;
 ```
 
 #### Handling Edge Cases:
-- **Delayed / Late Payment Webhook**: If Stripe confirms a payment after the hold has expired, the webhook processor checks whether the seat was claimed by someone else. If the seat is still unreserved, it finalizes the booking; if another buyer grabbed the seat in the interim, the webhook handler **automatically triggers a full refund** through Stripe and sends an apologetic email with credit, guaranteeing zero double-allocation.
-- **Frontend / Cache Independence**: The frontend and Redis caches are strictly treated as advisory viewing layers. Final booking and payment clearance **always** execute against the primary PostgreSQL database under explicit transactional locks.
+
+- **Concurrent Requests for the Same Seat at Checkout**: Because Step 1 uses `SELECT ... FOR UPDATE`, the second concurrent checkout is blocked at the database lock level. When the first transaction commits and marks the seat `SOLD`, the second transaction re-reads and fails the `hold_token` / `status` check, rolling back cleanly with a `409 Conflict`.
+- **Payment Failure / Declined Card**: The database hold is preserved for the hold's remaining duration. The user can retry with a different payment method without losing their reserved seat.
+- **Client Retry with Same Idempotency Key**: The `UNIQUE` constraint on `orders(idempotency_key)` ensures a retry of an already-successful checkout returns the original order rather than creating a duplicate charge or a duplicate `seat_allocation`.
+- **Delayed / Late Payment Webhook**: If Stripe confirms a payment after the hold has expired and the seat has been re-allocated to another buyer, the webhook processor detects that `seat_allocations` already contains a row for `(event_id, seat_id)`. It cannot insert a second row (error 23505), so it **automatically triggers a full refund** through Stripe and notifies the user, guaranteeing zero double-allocation and zero financial loss.
+- **Frontend / Cache Independence**: The frontend and Redis caches are strictly advisory viewing layers. Final booking and payment clearance **always** execute against the primary PostgreSQL database under explicit transactional locks. Redis showing a seat as "available" is never sufficient to grant a booking.
 
 ---
 
