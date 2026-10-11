@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>QuickNotes - Note Editor</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="script.js" defer></script>
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <div class="header-brand">
+        <h1>QuickNotes</h1>
+        <p>Capture your thoughts instantly and stay organized.</p>
+      </div>
+      <div class="header-actions">
+        <nav>
+          <a href="../day1/index.html">Home</a>
+          <a href="../day1/about.html">About</a>
+        </nav>
+        <button id="theme-toggle" type="button">Dark mode</button>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section class="editor-card">
+      <div class="editor-header">
+        <label for="note-text" class="editor-label">Your Note</label>
+        <span class="editor-badge">Live Counter</span>
+      </div>
+
+      <textarea
+        id="note-text"
+        name="note-text"
+        placeholder="Start typing your note here (up to 200 characters)..."
+        rows="8"
+      ></textarea>
+
+      <div class="stats-container">
+        <p id="char-count">0 / 200 characters</p>
+        <p id="word-count">0 words</p>
+      </div>
+
+      <div class="editor-actions">
+        <span class="hint-text">Tip: Press <kbd>Esc</kbd> to quickly clear your note</span>
+        <button id="clear-btn" type="button">Clear</button>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>&copy; 2026 QuickNotes. All rights reserved.</p>
+  </footer>
+</body>
+</html>
